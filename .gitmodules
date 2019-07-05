@@ -1,0 +1,3 @@
+[submodule "wsocket"]
+	path = wsocket
+	url = https://github.com/lazytinker/wsocket.git
