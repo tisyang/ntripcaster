@@ -21,6 +21,11 @@ static wsocket listen_on(const char *addr, const char* service)
     }
     for (const struct addrinfo *p = ai; p != NULL; p = p->ai_next) {
         sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (wsocket_set_nonblocking(sock) == WSOCKET_ERROR) {
+            LOG_ERROR("set nonblocking error, %s", wsocket_strerror(wsocket_errno));
+            wsocket_close(sock);
+            return INVALID_WSOCKET;
+        }
         if (sock == INVALID_WSOCKET) {
             continue;
         }
@@ -70,6 +75,10 @@ int main(int argc, const char *argv[])
         LOG_INFO("setup server on 1024 OK.");
     }
     sleep(3);
+
+
+
+    
     WSOCKET_CLEANUP();
     return 0;
 }
