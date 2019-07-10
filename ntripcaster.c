@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <stddef.h>
 
 enum ntrip_agent_type {
     NTRIP_PENDING_AGENT = 0,
@@ -22,11 +23,13 @@ struct ntrip_agent {
     wsocket socket;
     int  type;                  // agent type: ntrip_agent_type
     char username[32];          // agent ntrip username(valid for ntrip client)
-    char mountpoint[128];       // mountpoint requested by agent
+    char mountpoint[64];        // mountpoint requested by agent
     char peeraddr[NI_MAXHOST];  // agent ip address
     char user_agent[64];        // agent ntrip user agent string
     time_t login_time;          // agent login time
     ev_tstamp last_activity;    // agent last IO time
+    unsigned char pending_recv[1024];// pending agent socket recv buffer
+    size_t pending_idx;              // pending agent socket recv buffer index
 
     struct ntrip_caster* caster; // agent associate caster(not change during whole agent lifetime)
     TAILQ_ENTRY(ntrip_agent) entries;  // agent list
@@ -96,15 +99,6 @@ static wsocket listen_on(const char *addr, const char* service)
     return sock;
 }
 
-static void close_agent(struct ntrip_agent *agent)
-{
-    if (agent->type >= NTRIP_PENDING_AGENT && agent->type < NTRIP_AGENT_SENTRY) {
-        TAILQ_REMOVE(&agent->caster->m_agents_head[agent->type], agent, entries);
-    }
-    LOG_INFO("close agent(%d) from %s", agent->socket, agent->peeraddr);
-    wsocket_close(agent->socket);
-    free(agent);
-}
 
 static void agent_read_cb(EV_P_ ev_io *w, int revents)
 {
@@ -112,12 +106,17 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
     struct ntrip_agent *agent = (struct ntrip_agent *)w;
     if (agent->type >= NTRIP_PENDING_AGENT && agent->type < NTRIP_AGENT_SENTRY) {
         send(agent->socket, WARN, strlen(WARN), 0);
+        LOG_INFO("close agent(%d) from %s", agent->socket, agent->peeraddr);
+        TAILQ_REMOVE(&agent->caster->m_agents_head[agent->type], agent, entries);
         ev_io_stop(EV_A_ &agent->io);
-        close_agent(agent);
+        wsocket_close(agent->socket);
+        free(agent);
     } else {
         LOG_ERROR("error agent type=%d", agent->type);
+        LOG_INFO("close agent(%d) from %s", agent->socket, agent->peeraddr);
         ev_io_stop(EV_A_ &agent->io);
-        close_agent(agent);
+        wsocket_close(agent->socket);
+        free(agent);
     }
 }
 
@@ -168,7 +167,8 @@ static void caster_accept_cb(EV_P_ ev_io *w, int revents)
     snprintf(agent->peeraddr, sizeof(agent->peeraddr), "%s", addrbuf);
     agent->user_agent[0] = '\0';
     agent->login_time = time(NULL);
-    agent->last_activity = agent->login_time;
+    agent->last_activity = ev_now(EV_A);
+    agent->pending_idx = 0;
     agent->caster = caster;
 
     ev_io_init(&agent->io, agent_read_cb, WSOCKET_GET_FD(agent_socket), EV_READ);
@@ -179,8 +179,21 @@ static void caster_accept_cb(EV_P_ ev_io *w, int revents)
 
 static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
 {
-    // TODO:
-    LOG_DEBUG("caster timer triggered");
+    // check and remove non-active agent
+    struct ntrip_caster *caster = (struct ntrip_caster *)((char *)w - offsetof(struct ntrip_caster, timer));
+    ev_tstamp now = ev_now(EV_A);
+    struct ntrip_agent *agent, *temp;
+    for (int i = 0; i < NTRIP_AGENT_SENTRY; i++) {
+        TAILQ_FOREACH_SAFE(agent, &caster->m_agents_head[i], entries, temp) {
+            if (now - agent->last_activity >=5.0) {
+                LOG_INFO("close timeout agent(%d) from%s", agent->socket, agent->peeraddr);
+                TAILQ_REMOVE(&caster->m_agents_head[i], agent, entries);
+                ev_io_stop(EV_A_ &agent->io);
+                wsocket_close(agent->socket);
+                free(agent);
+            }
+        }
+    }
 }
 
 int main(int argc, const char *argv[])
@@ -203,7 +216,7 @@ int main(int argc, const char *argv[])
     caster.socket = sock;
     ev_io_init(&caster.io, caster_accept_cb, WSOCKET_GET_FD(sock), EV_READ);
     ev_io_start(EV_A_ &caster.io);
-    ev_timer_init(&caster.timer, caster_timeout_cb, 5, 5);
+    ev_timer_init(&caster.timer, caster_timeout_cb, 5, 3);
     ev_timer_start(EV_A_ &caster.timer);
 
     while (1) {
