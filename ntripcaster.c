@@ -3,7 +3,11 @@
 #include "wsocket/wsocket.h"
 #include "queue.h"
 
-#include <ev.h>
+#ifdef _WIN32
+# include "evwrap.h"
+#else
+# include <ev.h>
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -35,7 +39,7 @@ struct ntrip_agent {
     TAILQ_ENTRY(ntrip_agent) entries;  // agent list
 };
 
-// 用户密码等验证
+// for user password authorization
 struct ntrip_token {
     char token[64];         // token associate with mountpoint
     char mountpoint[64];    // mountpoint, * means any
@@ -380,7 +384,7 @@ static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
     struct ntrip_agent *agent, *temp;
     for (int i = 0; i < NTRIP_AGENT_SENTRY; i++) {
         TAILQ_FOREACH_SAFE(agent, &caster->m_agents_head[i], entries, temp) {
-            if (now - agent->last_activity >= 10.0) {
+            if (now - agent->last_activity >= 5.0) {
                 LOG_INFO("close timeout agent(%d) from %s", agent->socket, agent->peeraddr);
                 TAILQ_REMOVE(&caster->m_agents_head[i], agent, entries);
                 ev_io_stop(EV_A_ &agent->io);
@@ -393,7 +397,9 @@ static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
 
 int main(int argc, const char *argv[])
 {
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
     WSOCKET_INIT();
     struct ev_loop* loop = EV_DEFAULT;
     struct ntrip_caster caster = {0};
@@ -401,7 +407,7 @@ int main(int argc, const char *argv[])
         TAILQ_INIT(&caster.m_agents_head[i]);
     }
 
-    wsocket sock = listen_on(NULL, "1024");
+    wsocket sock = listen_on("0.0.0.0", "1024");
     if (sock == INVALID_WSOCKET) {
         LOG_ERROR("setup server error.");
         return 1;
@@ -416,7 +422,7 @@ int main(int argc, const char *argv[])
     ev_timer_start(EV_A_ &caster.timer);
 
     while (1) {
-        ev_run(loop, 0);
+        ev_loop(loop, 0);
     }
 
     WSOCKET_CLEANUP();
