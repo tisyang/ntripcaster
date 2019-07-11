@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <stddef.h>
+#include <signal.h>
 
 enum ntrip_agent_type {
     NTRIP_PENDING_AGENT = 0,
@@ -22,7 +23,6 @@ struct ntrip_agent {
     ev_io io;
     wsocket socket;
     int  type;                  // agent type: ntrip_agent_type
-    char username[32];          // agent ntrip username(valid for ntrip client)
     char mountpoint[64];        // mountpoint requested by agent
     char peeraddr[NI_MAXHOST];  // agent ip address
     char user_agent[64];        // agent ntrip user agent string
@@ -31,8 +31,15 @@ struct ntrip_agent {
     unsigned char pending_recv[1024];// pending agent socket recv buffer
     size_t pending_idx;              // pending agent socket recv buffer index
 
-    struct ntrip_caster* caster; // agent associate caster(not change during whole agent lifetime)
+    struct ntrip_caster* caster; // caster associate with agent(not change during whole agent lifetime)
     TAILQ_ENTRY(ntrip_agent) entries;  // agent list
+};
+
+// 用户密码等验证
+struct ntrip_token {
+    char token[64];         // token associate with mountpoint
+    char mountpoint[64];    // mountpoint, * means any
+    TAILQ_ENTRY(ntrip_token) entries;   // token list
 };
 
 struct ntrip_caster {
@@ -40,7 +47,15 @@ struct ntrip_caster {
     ev_timer timer; // timer for check agent alive
     wsocket socket;
     TAILQ_HEAD(, ntrip_agent) m_agents_head[NTRIP_AGENT_SENTRY]; // agent list for PENDING/CLIENT/SOURCE
+    TAILQ_HEAD(, ntrip_token) m_source_token_head;  // token list for ntrip server
+    TAILQ_HEAD(, ntrip_token) m_client_token_head;  // token list for ntrip client
 };
+
+
+#define NTRIP_RESPONSE_OK           "ICY 200 OK\r\n"
+#define NTRIP_RESPONSE_UNAUTHORIZED "HTTP/1.0 401 Unauthorized\r\n"
+#define NTRIP_RESPONSE_ERROR_PASSED "ERROR - Bad Password\r\n"
+#define NTRIP_RESPONSE_ERROR_MOUNTP "ERROR - Bad Mountpoint\r\n"
 
 static wsocket listen_on(const char *addr, const char* service)
 {
@@ -100,20 +115,201 @@ static wsocket listen_on(const char *addr, const char* service)
 }
 
 
+static void close_agent(struct ntrip_agent *agent)
+{
+    LOG_INFO("close agent(%d) from %s", agent->socket, agent->peeraddr);
+    TAILQ_REMOVE(&agent->caster->m_agents_head[agent->type], agent, entries);
+    wsocket_close(agent->socket);
+    free(agent);
+}
+
+static void delay_close_once_cb(int revents, void* arg)
+{
+    if (revents & EV_TIMER) {
+        struct ntrip_agent *agent = arg;
+        close_agent(agent);
+    }
+}
+
+
+
 static void agent_read_cb(EV_P_ ev_io *w, int revents)
 {
-#define WARN "YOU CAN NO SEND DATA\n"
     struct ntrip_agent *agent = (struct ntrip_agent *)w;
-    if (agent->type >= NTRIP_PENDING_AGENT && agent->type < NTRIP_AGENT_SENTRY) {
-        send(agent->socket, WARN, strlen(WARN), 0);
-        LOG_INFO("close agent(%d) from %s", agent->socket, agent->peeraddr);
-        TAILQ_REMOVE(&agent->caster->m_agents_head[agent->type], agent, entries);
+
+    if (agent->type == NTRIP_PENDING_AGENT) {
+        // read and check what type agent
+        int n = recv(agent->socket,
+                     agent->pending_recv + agent->pending_idx,
+                     sizeof(agent->pending_recv) - agent->pending_idx - 1,
+                     0);
+
+        if (n == WSOCKET_ERROR && wsocket_errno != EWOULDBLOCK) {
+            LOG_ERROR("agent(%d) recv error, %s", agent->socket, wsocket_strerror(wsocket_errno));
+            ev_io_stop(EV_A_ &agent->io);
+            close_agent(agent);
+            return;
+        }
+        if (n == 0) {
+            LOG_INFO("agent(%d) connection close", agent->socket);
+            ev_io_stop(EV_A_ &agent->io);
+            close_agent(agent);
+            return;
+        }
+        if (n < 0) { // maybe -1 since EWOULDBLOCK
+            return;
+        }
+        agent->last_activity = ev_now(EV_A);
+        agent->pending_idx =+ n;
+        // check pending buffer overflow
+        if (agent->pending_idx >= sizeof(agent->pending_recv) - 1) {
+            LOG_ERROR("agent(%d) request buffer overflow", agent->socket);
+            ev_io_stop(EV_A_ &agent->io);
+            close_agent(agent);
+            return;
+        }
+        agent->pending_recv[agent->pending_idx] = '\0';
+        // test GET (ntrip client) or SOURCE (ntrip server)
+        do {
+            char* p = strstr(agent->pending_recv, "GET");
+            if (p) {
+                // ntrip client
+                char *q, *ag;
+                if (!(q = strstr(p, "\r\n")) || !(ag = strstr(q, "User-Agent:")) || !strstr(ag, "\r\n")) {
+                    break;
+                }
+                ag += strlen("User-Agent:");
+                // fill user agent
+                sscanf(ag, "%63[^\n]", agent->user_agent);
+                // test protocol
+                char url[64], proto[64];
+                url[0] = '\0';
+                proto[0] = '\0';
+                if (sscanf(p, "GET %63s %63s", url, proto) < 2 || strcmp(proto, "HTTP/1.0") != 0) {
+                    LOG_ERROR("invalid ntrip proto=%s", proto);
+                    break;
+                }
+                if ((p = strchr(url, '/'))) {
+                    p += 1;
+                }
+                snprintf(agent->mountpoint, sizeof(agent->mountpoint), "%s", p);
+                // TODO: check if mountpoint exist
+                if (agent->mountpoint[0] == '\0' || strcmp(agent->mountpoint, "/") == 0) {
+                    // TODO: send source table
+                    ev_io_stop(EV_A_ &agent->io);
+                    close_agent(agent);
+                    return;
+                }
+                // TODO: check authentication
+                // send response
+                send(agent->socket, NTRIP_RESPONSE_OK, strlen(NTRIP_RESPONSE_OK), 0);
+                // move to clients list from pending
+                agent->pending_idx = 0;
+                TAILQ_REMOVE(&agent->caster->m_agents_head[agent->type], agent, entries);
+                agent->type = NTRIP_CLIENT_AGENT;
+                TAILQ_INSERT_TAIL(&agent->caster->m_agents_head[agent->type], agent, entries);
+                LOG_INFO("move agent(%d) into client agents", agent->socket);
+                return;
+            }
+            p = strstr(agent->pending_recv, "SOURCE");
+            if (p) {
+                // ntrip server
+                char *q, *ag;
+                if (!(q = strstr(p, "\r\n")) || !(ag = strstr(q, "Source-Agent:")) || !strstr(ag, "\r\n")) {
+                    break;
+                }
+                ag += strlen("Source-Agent:");
+                // fill user agent
+                sscanf(ag, "%63[^\n]", agent->user_agent);
+                // get passwd and url
+                char url[64], passwd[64];
+                url[0] = '\0';
+                passwd[0] = '\0';
+                if (sscanf(p, "SOURCE %63s %63s", passwd, url) < 2) {
+                    break;
+                }
+                snprintf(agent->mountpoint, sizeof(agent->mountpoint), "%s", url);
+
+                // check if mountpoint exist
+                if (agent->mountpoint[0] == '\0' || strcmp(agent->mountpoint, "/") == 0) {
+                    send(agent->socket, NTRIP_RESPONSE_ERROR_MOUNTP, strlen(NTRIP_RESPONSE_ERROR_MOUNTP), 0);
+                    ev_io_stop(EV_A_ &agent->io);
+                    close_agent(agent);
+                    return;
+                }
+                // TODO: check authentication
+                // send response
+                send(agent->socket, NTRIP_RESPONSE_OK, strlen(NTRIP_RESPONSE_OK), 0);
+                // move to clients list from pending
+                agent->pending_idx = 0;
+                TAILQ_REMOVE(&agent->caster->m_agents_head[agent->type], agent, entries);
+                agent->type = NTRIP_SOURCE_AGENT;
+                TAILQ_INSERT_TAIL(&agent->caster->m_agents_head[agent->type], agent, entries);
+                LOG_INFO("move agent(%d) into source agents", agent->socket);
+                return;
+            }
+            // not matching
+        } while(0);
+        // error occurs, stop and close agent
+        LOG_INFO("agent(%d) request error", agent->socket);
         ev_io_stop(EV_A_ &agent->io);
-        wsocket_close(agent->socket);
-        free(agent);
+        close_agent(agent);
+    } else if (agent->type == NTRIP_CLIENT_AGENT) {
+        // ntrip client read
+        // now will read and discard client gga message
+        char buf[512];
+        int n = recv(agent->socket, buf, sizeof(buf) - 1, 0);
+        if (n == WSOCKET_ERROR && wsocket_errno != EWOULDBLOCK) {
+            LOG_ERROR("agent(%d) recv error, %s", agent->socket, wsocket_strerror(wsocket_errno));
+            ev_io_stop(EV_A_ &agent->io);
+            close_agent(agent);
+            return;
+        }
+        if (n == 0) {
+            LOG_INFO("agent(%d) connection close", agent->socket);
+            ev_io_stop(EV_A_ &agent->io);
+            close_agent(agent);
+            return;
+        }
+        if (n < 0) { // maybe -1 since EWOULDBLOCK
+            return;
+        }
+
+        agent->last_activity = ev_now(EV_A);
+        // discard client data
+    } else if (agent->type == NTRIP_SOURCE_AGENT) {
+        // ntrip server read
+        char buf[512];
+        int n = recv(agent->socket, buf, sizeof(buf) - 1, 0);
+        if (n == WSOCKET_ERROR && wsocket_errno != EWOULDBLOCK) {
+            LOG_ERROR("agent(%d) recv error, %s", agent->socket, wsocket_strerror(wsocket_errno));
+            ev_io_stop(EV_A_ &agent->io);
+            close_agent(agent);
+            return;
+        }
+        if (n == 0) {
+            LOG_INFO("agent(%d) connection close", agent->socket);
+            ev_io_stop(EV_A_ &agent->io);
+            close_agent(agent);
+            return;
+        }
+        if (n < 0) { // maybe -1 since EWOULDBLOCK
+            return;
+        }
+
+        agent->last_activity = ev_now(EV_A);
+        // send data to every match mountpoint clients
+        struct ntrip_agent *client, *temp;
+        TAILQ_FOREACH_SAFE(client, &agent->caster->m_agents_head[NTRIP_CLIENT_AGENT], entries, temp) {
+            if (strcasecmp(agent->mountpoint, client->mountpoint) == 0) {
+                if (send(client->socket, buf, n, 0) != WSOCKET_ERROR) {
+                    client->last_activity = ev_now(EV_A);
+                }
+            }
+        }
     } else {
-        LOG_ERROR("error agent type=%d", agent->type);
-        LOG_INFO("close agent(%d) from %s", agent->socket, agent->peeraddr);
+        LOG_ERROR("close error type agent(%d, type=%d) from %s",
+                  agent->socket, agent->type, agent->peeraddr);
         ev_io_stop(EV_A_ &agent->io);
         wsocket_close(agent->socket);
         free(agent);
@@ -162,7 +358,6 @@ static void caster_accept_cb(EV_P_ ev_io *w, int revents)
     }
     agent->socket = agent_socket;
     agent->type = NTRIP_PENDING_AGENT;
-    agent->username[0] = '\0';
     agent->mountpoint[0] = '\0';
     snprintf(agent->peeraddr, sizeof(agent->peeraddr), "%s", addrbuf);
     agent->user_agent[0] = '\0';
@@ -185,8 +380,8 @@ static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
     struct ntrip_agent *agent, *temp;
     for (int i = 0; i < NTRIP_AGENT_SENTRY; i++) {
         TAILQ_FOREACH_SAFE(agent, &caster->m_agents_head[i], entries, temp) {
-            if (now - agent->last_activity >=5.0) {
-                LOG_INFO("close timeout agent(%d) from%s", agent->socket, agent->peeraddr);
+            if (now - agent->last_activity >= 10.0) {
+                LOG_INFO("close timeout agent(%d) from %s", agent->socket, agent->peeraddr);
                 TAILQ_REMOVE(&caster->m_agents_head[i], agent, entries);
                 ev_io_stop(EV_A_ &agent->io);
                 wsocket_close(agent->socket);
@@ -198,6 +393,7 @@ static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
 
 int main(int argc, const char *argv[])
 {
+    signal(SIGPIPE, SIG_IGN);
     WSOCKET_INIT();
     struct ev_loop* loop = EV_DEFAULT;
     struct ntrip_caster caster = {0};

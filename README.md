@@ -1,10 +1,10 @@
 # ntripcaster
 Ntrip broadcaster written in c and libev.
 
-NOT READY for now.
+For now, it can now transmit data between ntrip servers and ntrip clients, without source table and authorization support.
 
 ## Build
-Need cmake and git.
+Need cmake and git and libev.
 
 ```shell
 git clone https://github.com/lazytinker/ntripcaster.git
@@ -19,5 +19,5 @@ make
 
 ## Usage
 
-NOT READY.
+Run it, it will listen on port 1024.
 
