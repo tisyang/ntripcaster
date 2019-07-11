@@ -242,6 +242,20 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                     return;
                 }
                 // TODO: check authentication
+                // check if mountpoint source already exists
+                // if so, then reject new agent
+                struct ntrip_agent *server;
+                TAILQ_FOREACH(server, &agent->caster->m_agents_head[NTRIP_SOURCE_AGENT], entries) {
+                    if (strcasecmp(server->mountpoint, agent->mountpoint) == 0) {
+                        // reject new agent
+                        LOG_WARN("agent(%d) attempt source mountpoint(%s) which already has source agent(%d)",
+                                 agent->socket, agent->mountpoint, server->socket);
+                        send(agent->socket, NTRIP_RESPONSE_ERROR_MOUNTP, strlen(NTRIP_RESPONSE_ERROR_MOUNTP), 0);
+                        ev_io_stop(EV_A_ &agent->io);
+                        close_agent(agent);
+                        return;
+                    }
+                }
                 // send response
                 send(agent->socket, NTRIP_RESPONSE_OK, strlen(NTRIP_RESPONSE_OK), 0);
                 // move to clients list from pending
