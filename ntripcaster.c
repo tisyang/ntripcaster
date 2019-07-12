@@ -413,7 +413,8 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
         if (n < 0) { // maybe -1 since WSOCKET_EWOULDBLOCK
             return;
         }
-
+        agent->in_bytes += n;
+        agent->in_bps = n * 8;
         agent->last_activity = ev_now(EV_A);
         // discard client data
     } else if (agent->type == NTRIP_SOURCE_AGENT) {
@@ -435,13 +436,16 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
         if (n < 0) { // maybe -1 since WSOCKET_EWOULDBLOCK
             return;
         }
-
+        agent->in_bytes += n;
+        agent->in_bps = n * 8;
         agent->last_activity = ev_now(EV_A);
         // send data to every match mountpoint clients
         struct ntrip_agent *client, *temp;
         TAILQ_FOREACH_SAFE(client, &agent->caster->agents_head[NTRIP_CLIENT_AGENT], entries, temp) {
             if (strcasecmp(agent->mountpoint, client->mountpoint) == 0) {
                 if (send(client->socket, buf, n, 0) != WSOCKET_ERROR) {
+                    client->out_bytes += n;
+                    client->out_bps = n * 8;
                     client->last_activity = ev_now(EV_A);
                 }
             }
@@ -524,13 +528,26 @@ static void caster_accept_cb(EV_P_ ev_io *w, int revents)
 
 static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
 {
+#define TRAFFIC_STATUS_FMT "%-8s %-8s %-16s %-5d %-8d %s\n"
     // check and remove non-active agent
+    // output clients and servers traffic
     struct ntrip_caster *caster = (struct ntrip_caster *)((char *)w - offsetof(struct ntrip_caster, timer));
     ev_tstamp now = ev_now(EV_A);
     struct ntrip_agent *agent, *temp;
+    puts("======= Current clients/servers status ========");
+    printf("%-8s %-8s %-16s %-5s %-8s %s\n", "Type", "MountP", "From", "Bps", "Bytes", "UserAgent");
     for (int i = 0; i < NTRIP_AGENT_SENTRY; i++) {
         TAILQ_FOREACH_SAFE(agent, &caster->agents_head[i], entries, temp) {
-            if (now - agent->last_activity >= 5.0) {
+            if (i == NTRIP_CLIENT_AGENT) {
+                printf(TRAFFIC_STATUS_FMT,
+                       "Client", agent->mountpoint, agent->peeraddr,
+                       agent->out_bps, agent->out_bytes, agent->user_agent);
+            } else if (i == NTRIP_SOURCE_AGENT) {
+                printf(TRAFFIC_STATUS_FMT,
+                       "Server", agent->mountpoint, agent->peeraddr,
+                       agent->in_bps, agent->in_bytes, agent->user_agent);
+            }
+            if (now - agent->last_activity >= 10.0) {
                 LOG_INFO("timeout agent(%d) from %s", agent->socket, agent->peeraddr);
                 ev_io_stop(EV_A_ &agent->io);
                 close_agent(agent);
@@ -577,7 +594,7 @@ int main(int argc, const char *argv[])
     caster.socket = sock;
     ev_io_init(&caster.io, caster_accept_cb, WSOCKET_GET_FD(sock), EV_READ);
     ev_io_start(EV_A_ &caster.io);
-    ev_timer_init(&caster.timer, caster_timeout_cb, 5, 3);
+    ev_timer_init(&caster.timer, caster_timeout_cb, 5, 5);
     ev_timer_start(EV_A_ &caster.timer);
 
     while (1) {
