@@ -37,9 +37,9 @@ struct ntrip_agent {
 
     //TODO: traffic status
     size_t in_bytes;    // in bound bytes
-    size_t in_Bps;      // in bound Bps (bytes/s)
+    size_t in_bps;      // in bound bps
     size_t out_bytes;   // out bound bytes
-    size_t out_Bps;     // out bound Bps (bytes/s)
+    size_t out_bps;     // out bound bps
 
     struct ntrip_caster* caster; // caster associate with agent(not change during whole agent lifetime)
     TAILQ_ENTRY(ntrip_agent) entries;  // agent list
@@ -155,10 +155,64 @@ static void delay_close_once_cb(int revents, void* arg)
 {
     if (revents & EV_TIMER) {
         struct ntrip_agent *agent = arg;
+        LOG_INFO("now will close agent(%d) after delay", agent->socket);
         close_agent(agent);
     }
 }
 
+
+// check if caster has  the mountpoint source
+static int caster_has_mountpoint(const struct ntrip_caster *caster, const char* mnt)
+{
+    // invalid mnt
+    if (mnt[0] == '\0' || strcmp(mnt, "/") == 0) {
+        return 0;
+    }
+    struct ntrip_agent *server;
+    TAILQ_FOREACH(server, &caster->agents_head[NTRIP_SOURCE_AGENT], entries) {
+        if (strcasecmp(server->mountpoint, mnt) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char* caster_gen_sourcetable(const struct ntrip_caster *caster)
+{
+    // only generate once in few seconds
+    // max source table chars sizeof(_srctbbuf) - 1
+    static ev_tstamp _srctbupdt = 0;
+    static char _srctbbuf[10240];
+    // return old generate if just a little later
+    ev_tstamp now = ev_time();
+    if (now - _srctbupdt <= 3.0) {
+        return _srctbbuf;
+    }
+    _srctbupdt = now;
+    _srctbbuf[0] = '\0';
+    char str[256];
+    int idx = 0;
+    struct ntrip_agent *agent;
+    TAILQ_FOREACH(agent, &caster->agents_head[NTRIP_SOURCE_AGENT], entries) {
+        str[0] = '\0';
+        // format one str
+        int rv = snprintf(str, sizeof(str),
+                          "STR;%s;%s;RTCM3X;1005(10),1074-1084-1124(1);2;GNSS;NET;CHN;0.00;0.00;1;1;None;None;B;N;%d;;\r\n",
+                          agent->mountpoint, agent->mountpoint, agent->in_bps);
+        if (rv <= 0) {
+            break;
+        }
+        rv = snprintf(_srctbbuf + idx, sizeof(_srctbbuf) - idx, "%s", str);
+        if (rv <= 0) {
+            break;
+        }
+        idx += rv;
+        if (idx >= sizeof(_srctbbuf) - 1) {
+            break;
+        }
+    }
+    return _srctbbuf;
+}
 
 
 static void agent_read_cb(EV_P_ ev_io *w, int revents)
@@ -217,15 +271,31 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                     LOG_ERROR("invalid ntrip proto=%s", proto);
                     break;
                 }
-                if ((p = strchr(url, '/'))) {
-                    p += 1;
-                }
-                snprintf(agent->mountpoint, sizeof(agent->mountpoint), "%s", p);
-                // TODO: check if mountpoint exist
-                if (agent->mountpoint[0] == '\0' || strcmp(agent->mountpoint, "/") == 0) {
-                    // TODO: send source table
+                snprintf(agent->mountpoint, sizeof(agent->mountpoint), "%s", url[0] == '/' ? url + 1 : url);
+                // check if mountpoint exist, if not , send source table
+                if (!caster_has_mountpoint(agent->caster, agent->mountpoint)) {
+                    // send source table
+                    LOG_DEBUG("send source table to agent(%d) from %s",
+                              agent->socket, agent->peeraddr);
+                    const char *srctb = caster_gen_sourcetable(agent->caster);
+                    int srctblen = strlen(srctb);
+                    char buf[256];
+                    buf[0] = '\0';
+                    time_t now = time(NULL);
+                    snprintf(buf, sizeof(buf),
+                             "SOURCETABLE 200 OK\r\n"
+                             "Server: Ntripcaster 1.0\r\n"
+                             "Date: %s UTC\r\n"
+                             "Connection: close\r\n"
+                             "Content-Type: text/plain\r\n"
+                             "Content-Length: %d\r\n\r\n",
+                             asctime(gmtime(&now)), srctblen);
+                    if (send(agent->socket, buf, strlen(buf), 0) > 0) {
+                        send(agent->socket, srctb, srctblen, 0);
+                    }
+                    // delay close it to ensure send complete
                     ev_io_stop(EV_A_ &agent->io);
-                    close_agent(agent);
+                    ev_once(EV_A_ -1, EV_READ, 2.0, delay_close_once_cb, agent);
                     return;
                 }
                 // TODO: check authentication
@@ -271,29 +341,22 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                 if (sscanf(p, "SOURCE %63s %63s", passwd, url) < 2) {
                     break;
                 }
-                snprintf(agent->mountpoint, sizeof(agent->mountpoint), "%s", url);
-
-                // check if mountpoint exist
+                snprintf(agent->mountpoint, sizeof(agent->mountpoint), "%s", url[0] == '/' ? url + 1 : url);
+                // check if mountpoint
                 if (agent->mountpoint[0] == '\0' || strcmp(agent->mountpoint, "/") == 0) {
+                    LOG_WARN("agent(%d) source invalid mountpoint '%s'", agent->socket, agent->mountpoint);
                     send(agent->socket, NTRIP_RESPONSE_ERROR_MOUNTP, strlen(NTRIP_RESPONSE_ERROR_MOUNTP), 0);
-                    ev_io_stop(EV_A_ &agent->io);
-                    close_agent(agent);
-                    return;
+                    break;
                 }
                 // TODO: check authentication
                 // check if mountpoint source already exists
                 // if so, then reject new agent
-                struct ntrip_agent *server;
-                TAILQ_FOREACH(server, &agent->caster->agents_head[NTRIP_SOURCE_AGENT], entries) {
-                    if (strcasecmp(server->mountpoint, agent->mountpoint) == 0) {
-                        // reject new agent
-                        LOG_WARN("agent(%d) attempt source mountpoint(%s) which already has source agent(%d)",
-                                 agent->socket, agent->mountpoint, server->socket);
-                        send(agent->socket, NTRIP_RESPONSE_ERROR_MOUNTP, strlen(NTRIP_RESPONSE_ERROR_MOUNTP), 0);
-                        ev_io_stop(EV_A_ &agent->io);
-                        close_agent(agent);
-                        return;
-                    }
+                if (caster_has_mountpoint(agent->caster, agent->mountpoint)) {
+                    // reject new agent
+                    LOG_WARN("agent(%d) attempt source mountpoint(%s) which already has source agent",
+                             agent->socket, agent->mountpoint);
+                    send(agent->socket, NTRIP_RESPONSE_ERROR_MOUNTP, strlen(NTRIP_RESPONSE_ERROR_MOUNTP), 0);
+                    break;
                 }
                 // check if source agents count max
                 if (agent->caster->config.MAX_SOURCE_CNT > 0 &&
@@ -479,6 +542,8 @@ static void caster_init_config(struct ntrip_caster_config *config)
     config->MAX_CLIENT_CNT  = DEFAULT_MAX_CLIENT_AGENT;
     config->MAX_SOURCE_CNT  = DEFAULT_MAX_SOURCE_AGENT;
     TAILQ_INIT(&config->token_head);
+    snprintf(config->bind_addr, sizeof(config->bind_addr), "%s", "0.0.0.0");
+    snprintf(config->bind_serv, sizeof(config->bind_serv), "%d", 2101);
     // TODO: read from config file
 }
 
@@ -497,12 +562,12 @@ int main(int argc, const char *argv[])
         TAILQ_INIT(&caster.agents_head[i]);
     }
 
-    wsocket sock = listen_on("0.0.0.0", "2101");
+    wsocket sock = listen_on(caster.config.bind_addr, caster.config.bind_serv);
     if (sock == INVALID_WSOCKET) {
         LOG_ERROR("setup server error.");
         return 1;
     } else {
-        LOG_INFO("setup server on 2101 OK.");
+        LOG_INFO("setup server on %s:%s OK.", caster.config.bind_addr, caster.config.bind_serv);
     }
 
     caster.socket = sock;
