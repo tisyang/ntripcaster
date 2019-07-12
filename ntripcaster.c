@@ -197,7 +197,7 @@ static const char* caster_gen_sourcetable(const struct ntrip_caster *caster)
         str[0] = '\0';
         // format one str
         int rv = snprintf(str, sizeof(str),
-                          "STR;%s;%s;RTCM3X;1005(10),1074-1084-1124(1);2;GNSS;NET;CHN;0.00;0.00;1;1;None;None;B;N;%d;;\r\n",
+                          "STR;%s;%s;RTCM3X;1005(10),1074-1084-1124(1);2;GNSS;NET;CHN;0.00;0.00;1;1;None;None;B;N;%d;\r\n",
                           agent->mountpoint, agent->mountpoint, agent->in_bps);
         if (rv <= 0) {
             break;
@@ -207,10 +207,11 @@ static const char* caster_gen_sourcetable(const struct ntrip_caster *caster)
             break;
         }
         idx += rv;
-        if (idx >= sizeof(_srctbbuf) - 1) {
+        if (idx >= sizeof(_srctbbuf) - 20) {
             break;
         }
     }
+    snprintf(_srctbbuf + idx, sizeof(_srctbbuf) - idx, "ENDSOURCETABLE\r\n");
     return _srctbbuf;
 }
 
@@ -282,14 +283,17 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                     char buf[256];
                     buf[0] = '\0';
                     time_t now = time(NULL);
+                    // NOTE: DO NOT use time functions in LOG_XXX macros
+                    char* timestr = strdup(asctime(gmtime(&now)));
                     snprintf(buf, sizeof(buf),
                              "SOURCETABLE 200 OK\r\n"
                              "Server: Ntripcaster 1.0\r\n"
-                             "Date: %s UTC\r\n"
+                             "Date: %.24s UTC\r\n"
                              "Connection: close\r\n"
                              "Content-Type: text/plain\r\n"
                              "Content-Length: %d\r\n\r\n",
-                             asctime(gmtime(&now)), srctblen);
+                             timestr, srctblen);
+                    free(timestr);
                     if (send(agent->socket, buf, strlen(buf), 0) > 0) {
                         send(agent->socket, srctb, srctblen, 0);
                     }
