@@ -528,24 +528,24 @@ static void caster_accept_cb(EV_P_ ev_io *w, int revents)
 
 static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
 {
-#define TRAFFIC_STATUS_FMT "%-8s %-8s %-16s %-5d %-8d %s\n"
+#define TRAFFIC_STATUS_FMT "%-8s %-8s %-16s %-5d %-8d %s"
     // check and remove non-active agent
     // output clients and servers traffic
     struct ntrip_caster *caster = (struct ntrip_caster *)((char *)w - offsetof(struct ntrip_caster, timer));
     ev_tstamp now = ev_now(EV_A);
     struct ntrip_agent *agent, *temp;
-    puts("======= Current clients/servers status ========");
-    printf("%-8s %-8s %-16s %-5s %-8s %s\n", "Type", "MountP", "From", "Bps", "Bytes", "UserAgent");
+    LOG_TRACE("======= Current clients/servers status ========");
+    LOG_TRACE("%-8s %-8s %-16s %-5s %-8s %s", "Type", "MountP", "From", "Bps", "Bytes", "UserAgent");
     for (int i = 0; i < NTRIP_AGENT_SENTRY; i++) {
         TAILQ_FOREACH_SAFE(agent, &caster->agents_head[i], entries, temp) {
             if (i == NTRIP_CLIENT_AGENT) {
-                printf(TRAFFIC_STATUS_FMT,
-                       "Client", agent->mountpoint, agent->peeraddr,
-                       agent->out_bps, agent->out_bytes, agent->user_agent);
+                LOG_TRACE(TRAFFIC_STATUS_FMT,
+                          "Client", agent->mountpoint, agent->peeraddr,
+                          agent->out_bps, agent->out_bytes, agent->user_agent);
             } else if (i == NTRIP_SOURCE_AGENT) {
-                printf(TRAFFIC_STATUS_FMT,
-                       "Server", agent->mountpoint, agent->peeraddr,
-                       agent->in_bps, agent->in_bytes, agent->user_agent);
+                LOG_TRACE(TRAFFIC_STATUS_FMT,
+                          "Source", agent->mountpoint, agent->peeraddr,
+                          agent->in_bps, agent->in_bytes, agent->user_agent);
             }
             if (now - agent->last_activity >= 10.0) {
                 LOG_INFO("timeout agent(%d) from %s", agent->socket, agent->peeraddr);
