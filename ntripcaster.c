@@ -35,7 +35,6 @@ struct ntrip_agent {
     unsigned char pending_recv[1024];// pending agent socket recv buffer
     size_t pending_idx;              // pending agent socket recv buffer index
 
-    //TODO: traffic status
     size_t in_bytes;    // in bound bytes
     size_t in_bps;      // in bound bps
     size_t out_bytes;   // out bound bytes
@@ -48,8 +47,7 @@ struct ntrip_agent {
 // for authorization
 struct ntrip_token {
     char token[64];         // token
-    char read_mnt[64];      // associate mountpoint that token can read as client
-    char write_mnt[64];     // associate mountpoint that token can write as source server
+    char mnt[64];      // associate mountpoint
     TAILQ_ENTRY(ntrip_token) entries;   // token list
 };
 
@@ -73,9 +71,9 @@ struct ntrip_caster {
 };
 
 
-#define DEFAULT_MAX_PENDING_AGENT   20
-#define DEFAULT_MAX_CLIENT_AGENT    100
-#define DEFAULT_MAX_SOURCE_AGENT    20
+#define DEFAULT_MAX_PENDING_AGENT   5
+#define DEFAULT_MAX_CLIENT_AGENT    5
+#define DEFAULT_MAX_SOURCE_AGENT    3
 
 
 #define NTRIP_RESPONSE_OK           "ICY 200 OK\r\n"
@@ -197,7 +195,7 @@ static const char* caster_gen_sourcetable(const struct ntrip_caster *caster)
         str[0] = '\0';
         // format one str
         int rv = snprintf(str, sizeof(str),
-                          "STR;%s;%s;RTCM3X;1005(10),1074-1084-1124(1);2;GNSS;NET;CHN;0.00;0.00;1;1;None;None;B;N;%d;\r\n",
+                          "STR;%s;%s;RTCM3X;1005(10),1074-1084-1124(1);2;GNSS;NET;CHN;0.00;0.00;1;1;None;None;B;N;%zu;\r\n",
                           agent->mountpoint, agent->mountpoint, agent->in_bps);
         if (rv <= 0) {
             break;
@@ -215,6 +213,20 @@ static const char* caster_gen_sourcetable(const struct ntrip_caster *caster)
     return _srctbbuf;
 }
 
+static int caster_match_token(const struct ntrip_caster *caster,
+                               const char* token, const char* mnt)
+{
+    struct ntrip_token *key;
+    TAILQ_FOREACH(key, &caster->config.token_head, entries) {
+        if (strcmp(token, key->token) == 0) {
+            // TODO: wildcard matching
+            if (strcasecmp(key->mnt, mnt) == 0 || strcmp(key->mnt, "*") == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
 
 static void agent_read_cb(EV_P_ ev_io *w, int revents)
 {
@@ -302,11 +314,32 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                     ev_once(EV_A_ -1, EV_READ, 2.0, delay_close_once_cb, agent);
                     return;
                 }
-                // TODO: check authentication
+                // check authentication
+                int auth = 0; // if authorization success
+                if ((p = strstr(agent->pending_recv, "Authorization:"))) {
+                    char method[32];
+                    char token[64];
+                    method[0] = '\0';
+                    token[0] = '\0';
+                    if (sscanf(p, "Authorization: %31s %63s", method, token) == 2) {
+                        if (strcmp(method, "Basic") == 0) {
+                            // match token
+                            if (caster_match_token(agent->caster, token, agent->mountpoint)) {
+                                auth = 1;
+                            }
+                        }
+                    }
+                }
+                if (!auth) { // auth failed
+                    LOG_INFO("agent(%d) client authorization failed.", agent->socket);
+                    send(agent->socket, NTRIP_RESPONSE_UNAUTHORIZED,
+                         strlen(NTRIP_RESPONSE_UNAUTHORIZED), 0);
+                    break;
+                }
                 // check if client agents max count
                 if (agent->caster->config.MAX_CLIENT_CNT > 0 &&
                     agent->caster->config.MAX_CLIENT_CNT <= agent->caster->agents_cnt[NTRIP_CLIENT_AGENT]) {
-                    LOG_WARN("too many client agents, now=%d, MAX=%d",
+                    LOG_WARN("too many client agents, now=%zu, MAX=%zu",
                              agent->caster->agents_cnt[NTRIP_CLIENT_AGENT],
                              agent->caster->config.MAX_CLIENT_CNT);
                     // send error message
@@ -352,7 +385,13 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                     send(agent->socket, NTRIP_RESPONSE_ERROR_MOUNTP, strlen(NTRIP_RESPONSE_ERROR_MOUNTP), 0);
                     break;
                 }
-                // TODO: check authentication
+                // check authentication
+                if (!caster_match_token(agent->caster, passwd, agent->mountpoint)) {
+                    LOG_WARN("agent(%d) source authorization failed.", agent->socket);
+                    send(agent->socket, NTRIP_RESPONSE_ERROR_PASSED,
+                         strlen(NTRIP_RESPONSE_ERROR_PASSED), 0);
+                    break;
+                }
                 // check if mountpoint source already exists
                 // if so, then reject new agent
                 if (caster_has_mountpoint(agent->caster, agent->mountpoint)) {
@@ -365,7 +404,7 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                 // check if source agents count max
                 if (agent->caster->config.MAX_SOURCE_CNT > 0 &&
                     agent->caster->config.MAX_SOURCE_CNT <= agent->caster->agents_cnt[NTRIP_SOURCE_AGENT]) {
-                    LOG_WARN("too many source agents, now=%d, MAX=%d",
+                    LOG_WARN("too many source agents, now=%zu, MAX=%zu",
                              agent->caster->agents_cnt[NTRIP_SOURCE_AGENT],
                              agent->caster->config.MAX_SOURCE_CNT);
                     // send error message
@@ -377,7 +416,7 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                 }
                 // send response
                 send(agent->socket, NTRIP_RESPONSE_OK, strlen(NTRIP_RESPONSE_OK), 0);
-                // move to clients list from pending
+                // move to sources list from pending
                 agent->pending_idx = 0;
                 TAILQ_REMOVE(&agent->caster->agents_head[agent->type], agent, entries);
                 agent->caster->agents_cnt[agent->type] -= 1;
@@ -497,7 +536,7 @@ static void caster_accept_cb(EV_P_ ev_io *w, int revents)
     // check if pending agents max count
     if (caster->config.MAX_PENDING_CNT > 0 &&
         caster->config.MAX_PENDING_CNT <= caster->agents_cnt[NTRIP_PENDING_AGENT]) {
-        LOG_WARN("too many pending agents, now=%d, MAX=%d",
+        LOG_WARN("too many pending agents, now=%zu, MAX=%zu",
                  caster->agents_cnt[NTRIP_PENDING_AGENT],
                  caster->config.MAX_PENDING_CNT);
         LOG_INFO("reject agent(%d) from %s:%s", agent_socket, addrbuf, servbuf);
@@ -528,7 +567,7 @@ static void caster_accept_cb(EV_P_ ev_io *w, int revents)
 
 static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
 {
-#define TRAFFIC_STATUS_FMT "%-8s %-8s %-16s %-5d %-8d %s"
+#define TRAFFIC_STATUS_FMT "%-8s %-8s %-16s %-5zu %-8zu %s"
     // check and remove non-active agent
     // output clients and servers traffic
     struct ntrip_caster *caster = (struct ntrip_caster *)((char *)w - offsetof(struct ntrip_caster, timer));
