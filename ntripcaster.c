@@ -55,8 +55,9 @@ struct ntrip_caster_config {
     size_t MAX_PENDING_CNT; // pending agent count limit, 0 means no limit
     size_t MAX_CLIENT_CNT;  // client agent count limit, 0 means no limit
     size_t MAX_SOURCE_CNT;  // source agent count limit, 0 meas not limit
-    // TODO: token & other config
-    TAILQ_HEAD(, ntrip_token) token_head;  // token list
+    // token & other config
+    TAILQ_HEAD(, ntrip_token) client_token_head;  // client token list
+    TAILQ_HEAD(, ntrip_token) source_token_head;  // source token list
     char   bind_addr[64];   // caster bind address, "" means NULL
     char   bind_serv[16];   // caster bind port service
 };
@@ -213,11 +214,24 @@ static const char* caster_gen_sourcetable(const struct ntrip_caster *caster)
     return _srctbbuf;
 }
 
-static int caster_match_token(const struct ntrip_caster *caster,
-                               const char* token, const char* mnt)
+static int caster_match_client_token(const struct ntrip_caster *caster, const char* token, const char* mnt)
 {
     struct ntrip_token *key;
-    TAILQ_FOREACH(key, &caster->config.token_head, entries) {
+    TAILQ_FOREACH(key, &caster->config.client_token_head, entries) {
+        if (strcmp(token, key->token) == 0) {
+            // TODO: wildcard matching
+            if (strcasecmp(key->mnt, mnt) == 0 || strcmp(key->mnt, "*") == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int caster_match_source_token(const struct ntrip_caster *caster, const char* token, const char* mnt)
+{
+    struct ntrip_token *key;
+    TAILQ_FOREACH(key, &caster->config.source_token_head, entries) {
         if (strcmp(token, key->token) == 0) {
             // TODO: wildcard matching
             if (strcasecmp(key->mnt, mnt) == 0 || strcmp(key->mnt, "*") == 0) {
@@ -324,7 +338,7 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                     if (sscanf(p, "Authorization: %31s %63s", method, token) == 2) {
                         if (strcmp(method, "Basic") == 0) {
                             // match token
-                            if (caster_match_token(agent->caster, token, agent->mountpoint)) {
+                            if (caster_match_client_token(agent->caster, token, agent->mountpoint)) {
                                 auth = 1;
                             }
                         }
@@ -386,7 +400,7 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                     break;
                 }
                 // check authentication
-                if (!caster_match_token(agent->caster, passwd, agent->mountpoint)) {
+                if (!caster_match_source_token(agent->caster, passwd, agent->mountpoint)) {
                     LOG_WARN("agent(%d) source authorization failed.", agent->socket);
                     send(agent->socket, NTRIP_RESPONSE_ERROR_PASSED,
                          strlen(NTRIP_RESPONSE_ERROR_PASSED), 0);
@@ -601,7 +615,8 @@ static void caster_init_config(struct ntrip_caster_config *config)
     config->MAX_PENDING_CNT = DEFAULT_MAX_PENDING_AGENT;
     config->MAX_CLIENT_CNT  = DEFAULT_MAX_CLIENT_AGENT;
     config->MAX_SOURCE_CNT  = DEFAULT_MAX_SOURCE_AGENT;
-    TAILQ_INIT(&config->token_head);
+    TAILQ_INIT(&config->client_token_head);
+    TAILQ_INIT(&config->source_token_head);
     snprintf(config->bind_addr, sizeof(config->bind_addr), "%s", "0.0.0.0");
     snprintf(config->bind_serv, sizeof(config->bind_serv), "%d", 2101);
     // TODO: read from config file
