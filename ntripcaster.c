@@ -484,7 +484,7 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
         }
         agent->in_bytes += n;
         agent->in_bps = n * 8;
-        agent->last_activity = ev_now(EV_A);
+        // ignore clients input activity, not set last_activity
         // discard client data
     } else if (agent->type == NTRIP_SOURCE_AGENT) {
         // ntrip server read
