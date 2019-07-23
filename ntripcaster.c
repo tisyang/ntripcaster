@@ -72,11 +72,6 @@ struct ntrip_caster {
 };
 
 
-#define DEFAULT_MAX_PENDING_AGENT   5
-#define DEFAULT_MAX_CLIENT_AGENT    5
-#define DEFAULT_MAX_SOURCE_AGENT    3
-
-
 #define NTRIP_RESPONSE_OK           "ICY 200 OK\r\n"
 #define NTRIP_RESPONSE_UNAUTHORIZED "HTTP/1.0 401 Unauthorized\r\n"
 #define NTRIP_RESPONSE_FORBIDDEN    "HTTP/1.0 403 Forbidden\r\n"
@@ -214,11 +209,30 @@ static const char* caster_gen_sourcetable(const struct ntrip_caster *caster)
     return _srctbbuf;
 }
 
+static int caster_encbase64(char *str, const unsigned char *byte, int n)
+{
+    const char table[]=
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int i,j,k,b;
+    for (i=j=0;i/8<n;) {
+        for (k=b=0;k<6;k++,i++) {
+            b<<=1; if (i/8<n) b|=(byte[i/8]>>(7-i%8))&0x1;
+        }
+        str[j++]=table[b];
+    }
+    while (j&0x3) str[j++]='=';
+    str[j]='\0';
+    return j;
+}
+
 static int caster_match_client_token(const struct ntrip_caster *caster, const char* token, const char* mnt)
 {
     struct ntrip_token *key;
     TAILQ_FOREACH(key, &caster->config.client_token_head, entries) {
-        if (strcmp(token, key->token) == 0) {
+        char enc[128];
+        enc[0] = '\0';
+        caster_encbase64(enc, key->token, strlen(key->token));
+        if (strcmp(token, enc) == 0) {
             // TODO: wildcard matching
             if (strcasecmp(key->mnt, mnt) == 0 || strcmp(key->mnt, "*") == 0) {
                 return 1;
@@ -241,6 +255,8 @@ static int caster_match_source_token(const struct ntrip_caster *caster, const ch
     }
     return 0;
 }
+
+
 
 static void agent_read_cb(EV_P_ ev_io *w, int revents)
 {
@@ -607,19 +623,83 @@ static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
             }
         }
     }
+    LOG_TRACE("-----------------------------------------------");
 }
+
 
 static void caster_init_config(struct ntrip_caster_config *config)
 {
     // init default
-    config->MAX_PENDING_CNT = DEFAULT_MAX_PENDING_AGENT;
-    config->MAX_CLIENT_CNT  = DEFAULT_MAX_CLIENT_AGENT;
-    config->MAX_SOURCE_CNT  = DEFAULT_MAX_SOURCE_AGENT;
     TAILQ_INIT(&config->client_token_head);
     TAILQ_INIT(&config->source_token_head);
     snprintf(config->bind_addr, sizeof(config->bind_addr), "%s", "0.0.0.0");
     snprintf(config->bind_serv, sizeof(config->bind_serv), "%d", 2101);
-    // TODO: read from config file
+    // read from env
+    char *p = NULL;
+
+    p = getenv("NTRIP_ENV_ADDR");
+    p = p ? p : "0.0.0.0";
+    snprintf(config->bind_addr, sizeof(config->bind_addr), "%s", p);
+    LOG_INFO("use addr: %s", config->bind_addr);
+
+    p = getenv("NTRIP_ENV_PORT");
+    p = p ? p : "2101";
+    snprintf(config->bind_serv, sizeof(config->bind_serv), "%s", p);
+    LOG_INFO("use port: %s", config->bind_serv);
+
+    p = getenv("NTRIP_ENV_MAX_CLIENTS");
+    p = p ? p : "5";
+    config->MAX_CLIENT_CNT = atoi(p);
+    LOG_INFO("use max client limit: %d", config->MAX_CLIENT_CNT);
+
+    p = getenv("NTRIP_ENV_MAX_SOURCES");
+    p = p ? p : "3";
+    config->MAX_SOURCE_CNT = atoi(p);
+    LOG_INFO("use max source limit: %d", config->MAX_SOURCE_CNT);
+
+    p = getenv("NTRIP_ENV_MAX_PENDING");
+    p = p ? p : "3";
+    config->MAX_PENDING_CNT = atoi(p);
+    LOG_INFO("use max pending limit: %d", config->MAX_PENDING_CNT);
+
+    p = getenv("NTRIP_ENV_CLIENT_TOKEN");
+    p = p ? p : "001@whu:123/*";
+    {
+        char *lst = strdup(p);
+        char *q = strtok(lst, ";");
+        while (q) {
+            char *s = strrchr(q, '/');
+            if (s) {
+                *s = '\0';
+                struct ntrip_token * token = calloc(1, sizeof(struct ntrip_token));
+                snprintf(token->token, sizeof(token->token), "%s", q);
+                snprintf(token->mnt, sizeof(token->mnt), "%s", s+1);
+                TAILQ_INSERT_TAIL(&config->client_token_head, token, entries);
+            }
+            q = strtok(NULL, ";");
+        }
+        free(lst);
+    }
+
+
+    p = getenv("NTRIP_ENV_SOURCE_TOKEN");
+    p = p ? p : "admin/*";
+    {
+        char *lst = strdup(p);
+        char *q = strtok(lst, ";");
+        while (q) {
+            char *s = strrchr(q, '/');
+            if (s) {
+                *s = '\0';
+                struct ntrip_token * token = calloc(1, sizeof(struct ntrip_token));
+                snprintf(token->token, sizeof(token->token), "%s", q);
+                snprintf(token->mnt, sizeof(token->mnt), "%s", s+1);
+                TAILQ_INSERT_TAIL(&config->source_token_head, token, entries);
+            }
+            q = strtok(NULL, ";");
+        }
+        free(lst);
+    }
 }
 
 int main(int argc, const char *argv[])
