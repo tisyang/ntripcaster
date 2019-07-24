@@ -663,7 +663,7 @@ static void caster_init_config(struct ntrip_caster_config *config)
     LOG_INFO("use max pending limit: %d", config->MAX_PENDING_CNT);
 
     p = getenv("NTRIP_ENV_CLIENT_TOKEN");
-    p = p ? p : "001@whu:123/*";
+    p = p ? p : "admin:admin/*";
     {
         char *lst = strdup(p);
         char *q = strtok(lst, ";");
