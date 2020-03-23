@@ -1,6 +1,9 @@
+[submodule "ulog"]
+	path = ulog
+	url = https://github.com/tisyang/ulog.git
+[submodule "libev"]
+	path = libev
+	url = https://github.com/opensource-mirrors/libev.git
 [submodule "wsocket"]
 	path = wsocket
-	url = https://github.com/lazytinker/wsocket.git
-[submodule "logh"]
-	path = logh
-	url = https://github.com/lazytinker/log.h.git
+	url = https://github.com/tisyang/wsocket.git

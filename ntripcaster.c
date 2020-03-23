@@ -1,18 +1,22 @@
 #include <time.h>
-#include "logh/log.h"
+#include "ulog/ulog.h"
 #include "wsocket/wsocket.h"
 #include "queue.h"
+#include "cJSON/cJSON.h"
 
 #ifdef _WIN32
 # include "evwrap.h"
 #else
 # include <ev.h>
 #endif
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 #include <stddef.h>
 #include <signal.h>
+
+#define VERSION "1.1.0"
 
 enum ntrip_agent_type {
     NTRIP_PENDING_AGENT = 0,
@@ -46,7 +50,7 @@ struct ntrip_agent {
 
 // for authorization
 struct ntrip_token {
-    char token[64];         // token
+    char token[64];    // token
     char mnt[64];      // associate mountpoint
     TAILQ_ENTRY(ntrip_token) entries;   // token list
 };
@@ -329,7 +333,7 @@ static void agent_read_cb(EV_P_ ev_io *w, int revents)
                     char* timestr = strdup(asctime(gmtime(&now)));
                     snprintf(buf, sizeof(buf),
                              "SOURCETABLE 200 OK\r\n"
-                             "Server: Ntripcaster 1.0\r\n"
+                             "Server: https://github.com/tisyang/ntripcaster.git\r\n"
                              "Date: %.24s UTC\r\n"
                              "Connection: close\r\n"
                              "Content-Type: text/plain\r\n"
@@ -616,7 +620,7 @@ static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
                           "Source", agent->mountpoint, agent->peeraddr,
                           agent->in_bps, agent->in_bytes, agent->user_agent);
             }
-            if (now - agent->last_activity >= 10.0) {
+            if (now - agent->last_activity >= 60.0) {
                 LOG_INFO("timeout agent(%d) from %s", agent->socket, agent->peeraddr);
                 ev_io_stop(EV_A_ &agent->io);
                 close_agent(agent);
@@ -626,84 +630,129 @@ static void caster_timeout_cb(EV_P_ ev_timer *w, int revents)
     LOG_TRACE("-----------------------------------------------");
 }
 
+static cJSON* cjson_load_file(const char *file)
+{
+    FILE *fp = fopen(file, "r");
+    if (fp == NULL) {
+        LOG_ERROR("open file '%s' error, %s", file, strerror(errno));
+        return NULL;
+    }
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    if (len < 0) {
+        LOG_ERROR("cannot get file '%s' length, %s", file, strerror(errno));
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp); // reset to start
+    char *buf = malloc(len + 1);
+    if (buf == NULL) {
+        LOG_ERROR("malloc error, %s", strerror(errno));
+        fclose(fp);
+        return NULL;
+    }
+    buf[0] = '\0';
+    fread(buf, 1, len, fp);
+    buf[len] = '\0';
+    fclose(fp);
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    return root;
+}
 
-static void caster_init_config(struct ntrip_caster_config *config)
+static void caster_init_config(struct ntrip_caster_config *config, const char *cfgfile)
 {
     // init default
     TAILQ_INIT(&config->client_token_head);
     TAILQ_INIT(&config->source_token_head);
     snprintf(config->bind_addr, sizeof(config->bind_addr), "%s", "0.0.0.0");
     snprintf(config->bind_serv, sizeof(config->bind_serv), "%d", 2101);
-    // read from env
-    char *p = NULL;
+    config->MAX_CLIENT_CNT = 0;
+    config->MAX_SOURCE_CNT = 0;
+    config->MAX_PENDING_CNT = 10;
 
-    p = getenv("NTRIP_ENV_ADDR");
-    p = p ? p : "0.0.0.0";
-    snprintf(config->bind_addr, sizeof(config->bind_addr), "%s", p);
+    // load from json file
+    cJSON *cfg = cjson_load_file(cfgfile);
+    if (cfg) {
+        // address and port
+        cJSON *addr = cJSON_GetObjectItem(cfg, "listen_addr");
+        cJSON *port = cJSON_GetObjectItem(cfg, "listen_port");
+        if (addr && cJSON_IsString(addr)) {
+            snprintf(config->bind_addr, sizeof(config->bind_addr), "%s", addr->valuestring);
+        }
+        if ( port && cJSON_IsNumber(port)) {
+            snprintf(config->bind_serv, sizeof(config->bind_serv), "%d", port->valueint);
+        }
+
+        // limit
+        cJSON *max_client = cJSON_GetObjectItem(cfg, "max_client");
+        cJSON *max_source = cJSON_GetObjectItem(cfg, "max_source");
+        cJSON *max_pending = cJSON_GetObjectItem(cfg, "max_pending");
+        if (max_client && cJSON_IsNumber(max_client)) {
+            config->MAX_CLIENT_CNT = max_client->valueint;
+        }
+        if (max_source && cJSON_IsNumber(max_source)) {
+            config->MAX_SOURCE_CNT = max_source->valueint;
+        }
+        if (max_pending && cJSON_IsNumber(max_source)) {
+            config->MAX_PENDING_CNT = max_source->valueint;
+        }
+
+        // tokens
+        int cnt = 0;
+        cJSON *tokens_client = cJSON_GetObjectItem(cfg, "tokens_client");
+        if (tokens_client && cJSON_IsObject(tokens_client)) {
+            // iterate
+            cJSON *jp;
+            cJSON_ArrayForEach(jp, tokens_client) {
+                if (jp->string && cJSON_IsString(jp)) {
+                    struct ntrip_token * token = calloc(1, sizeof(struct ntrip_token));
+                    snprintf(token->token, sizeof(token->token), "%s", jp->string);
+                    snprintf(token->mnt, sizeof(token->mnt), "%s", jp->valuestring);
+                    TAILQ_INSERT_TAIL(&config->client_token_head, token, entries);
+                    cnt += 1;
+                }
+            }
+        }
+        LOG_INFO("load client tokens count: %d", cnt);
+
+        cnt = 0;
+        cJSON *tokens_source = cJSON_GetObjectItem(cfg, "tokens_source");
+        if (tokens_source && cJSON_IsObject(tokens_source)) {
+            // iterate
+            cJSON *jp;
+            cJSON_ArrayForEach(jp, tokens_source) {
+                if (jp->string && cJSON_IsString(jp)) {
+                    struct ntrip_token * token = calloc(1, sizeof(struct ntrip_token));
+                    snprintf(token->token, sizeof(token->token), "%s", jp->string);
+                    snprintf(token->mnt, sizeof(token->mnt), "%s", jp->valuestring);
+                    TAILQ_INSERT_TAIL(&config->source_token_head, token, entries);
+                    cnt += 1;
+                }
+            }
+        }
+        LOG_INFO("load client tokens count: %d", cnt);
+        cJSON_Delete(cfg);
+    } else {
+        LOG_ERROR("invalid json in config file '%s', using default setting", cfgfile);
+    }
     LOG_INFO("use addr: %s", config->bind_addr);
-
-    p = getenv("NTRIP_ENV_PORT");
-    p = p ? p : "2101";
-    snprintf(config->bind_serv, sizeof(config->bind_serv), "%s", p);
     LOG_INFO("use port: %s", config->bind_serv);
 
-    p = getenv("NTRIP_ENV_MAX_CLIENTS");
-    p = p ? p : "5";
-    config->MAX_CLIENT_CNT = atoi(p);
     LOG_INFO("use max client limit: %d", config->MAX_CLIENT_CNT);
-
-    p = getenv("NTRIP_ENV_MAX_SOURCES");
-    p = p ? p : "3";
-    config->MAX_SOURCE_CNT = atoi(p);
     LOG_INFO("use max source limit: %d", config->MAX_SOURCE_CNT);
-
-    p = getenv("NTRIP_ENV_MAX_PENDING");
-    p = p ? p : "3";
-    config->MAX_PENDING_CNT = atoi(p);
     LOG_INFO("use max pending limit: %d", config->MAX_PENDING_CNT);
-
-    p = getenv("NTRIP_ENV_CLIENT_TOKEN");
-    p = p ? p : "admin:admin/*";
-    {
-        char *lst = strdup(p);
-        char *q = strtok(lst, ";");
-        while (q) {
-            char *s = strrchr(q, '/');
-            if (s) {
-                *s = '\0';
-                struct ntrip_token * token = calloc(1, sizeof(struct ntrip_token));
-                snprintf(token->token, sizeof(token->token), "%s", q);
-                snprintf(token->mnt, sizeof(token->mnt), "%s", s+1);
-                TAILQ_INSERT_TAIL(&config->client_token_head, token, entries);
-            }
-            q = strtok(NULL, ";");
-        }
-        free(lst);
-    }
-
-
-    p = getenv("NTRIP_ENV_SOURCE_TOKEN");
-    p = p ? p : "admin/*";
-    {
-        char *lst = strdup(p);
-        char *q = strtok(lst, ";");
-        while (q) {
-            char *s = strrchr(q, '/');
-            if (s) {
-                *s = '\0';
-                struct ntrip_token * token = calloc(1, sizeof(struct ntrip_token));
-                snprintf(token->token, sizeof(token->token), "%s", q);
-                snprintf(token->mnt, sizeof(token->mnt), "%s", s+1);
-                TAILQ_INSERT_TAIL(&config->source_token_head, token, entries);
-            }
-            q = strtok(NULL, ";");
-        }
-        free(lst);
-    }
 }
 
 int main(int argc, const char *argv[])
 {
+    printf("ntripcaster ver %s\nby https://github.com/tisyang/ntripcaster\n", VERSION);
+
+    const char *cfgfile = "ntripcaster.json";
+    if (argc > 1)  {
+        cfgfile = argv[1];
+    }
+    LOG_INFO("using config file '%s'", cfgfile);
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
 #endif
@@ -711,7 +760,7 @@ int main(int argc, const char *argv[])
     struct ev_loop* loop = EV_DEFAULT;
     struct ntrip_caster caster = {0};
     // init caster config
-    caster_init_config(&caster.config);
+    caster_init_config(&caster.config, cfgfile);
     for (int i = 0; i < NTRIP_AGENT_SENTRY; i++) {
         caster.agents_cnt[i] = 0;
         TAILQ_INIT(&caster.agents_head[i]);
@@ -728,7 +777,7 @@ int main(int argc, const char *argv[])
     caster.socket = sock;
     ev_io_init(&caster.io, caster_accept_cb, WSOCKET_GET_FD(sock), EV_READ);
     ev_io_start(EV_A_ &caster.io);
-    ev_timer_init(&caster.timer, caster_timeout_cb, 5, 5);
+    ev_timer_init(&caster.timer, caster_timeout_cb, 10, 10);
     ev_timer_start(EV_A_ &caster.timer);
 
     while (1) {
