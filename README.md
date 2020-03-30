@@ -29,7 +29,8 @@ make
 ```
 
 ## Pre-build binaries 预编译二进制文件
-https://github.com/tisyang/ntripcaster_bin
+
+https://github.com/tisyang/ntripcaster/releases/
 
 ## Usage 使用
 
